@@ -12,8 +12,9 @@ Key filing quirks handled here:
 """
 
 import re
-from bs4 import BeautifulSoup
 import pandas as pd
+from bs4 import BeautifulSoup
+from datetime import datetime
 
 # Standard field order for a floating-rate debt row, once empty cells
 # and cosmetic $ / % symbols have been stripped out.
@@ -120,6 +121,24 @@ def _is_column_header_row(tokens: list[str]) -> bool:
     return bool(tokens) and tokens[0].startswith("Investments")
 
 
+DATE_PATTERN = re.compile(r"[A-Z][a-z]+[\s\xa0]+\d{1,2},[\s\xa0]+\d{4}")
+
+def _table_as_of_date(table) -> str | None:
+    """
+    Find the reporting date (e.g. 'September 30, 2025') that appears in
+    the title block immediately preceding this table — filings repeat
+    this header on every page, so it's a reliable per-table tag.
+    """
+    node = table.find_previous(string=DATE_PATTERN)
+    if not node:
+        return None
+    normalized = node.replace("\xa0", " ").strip()
+    try:
+        return datetime.strptime(normalized, "%B %d, %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def parse_all_tables(tables: list) -> pd.DataFrame:
     """
     Walk every Schedule of Investments table IN ORDER, carrying category
@@ -161,15 +180,16 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
                 continue  # category-level total, not a real position
 
             currency, remaining = _extract_currency(tokens)
+            has_floating_marker = any(t.endswith("+") for t in remaining)
 
             if len(remaining) == 11:
                 row_data = dict(zip(FLOATING_RATE_FIELDS, remaining))
-            elif len(remaining) == 10:
+            elif len(remaining) == 10 and not has_floating_marker:
                 row_data = dict(zip(FIXED_RATE_FIELDS, remaining))
-            elif len(remaining) == 8:
-                row_data = dict(zip(PREFERRED_EQUITY_FIELDS, remaining))
             elif len(remaining) == 7:
                 row_data = dict(zip(EQUITY_FIELDS, remaining))
+            elif len(remaining) == 8:
+                row_data = dict(zip(PREFERRED_EQUITY_FIELDS, remaining))
             elif len(remaining) == 5:
                 row_data = dict(zip(UNFUNDED_COMMITMENT_FIELDS, remaining))
             else:
@@ -178,8 +198,7 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
                     "debt_type": current_debt_type,
                     "industry": current_industry,
                     "raw_tokens": tokens,
-                    "raw_cells": raw_cells,  # keep the untouched cells too — 
-                                              # useful context for the AI classifier later
+                    "raw_cells": raw_cells,
                 })
                 continue
 
@@ -195,15 +214,20 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_filing_html(html: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def parse_filing_html(html: str, target_period_end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Returns (parsed_df, unmatched_df) — separating cleanly parsed positions
-    from rows that need AI-assisted classification (Phase 3) or manual review.
+    Parse only the CURRENT period's Schedule of Investments tables,
+    discarding the comparative prior-period tables that BDCs typically
+    include alongside them in the same filing.
+
+    target_period_end: the actual as-of date for this filing's current
+    schedule (e.g. '2025-09-30'), usually derived from the filing's
+    primary document filename via extract_period_end_date().
     """
-    tables = find_schedule_of_investments_tables(html)
-    df = parse_all_tables(tables)
-    
+    all_tables = find_schedule_of_investments_tables(html)
+    current_tables = [t for t in all_tables if _table_as_of_date(t) == target_period_end]
+
+    df = parse_all_tables(current_tables)
     parsed = df[df["raw_tokens"].isna()].drop(columns=["raw_tokens", "raw_cells"], errors="ignore")
     unmatched = df[df["raw_tokens"].notna()][["debt_type", "industry", "raw_tokens", "raw_cells"]]
-    
     return parsed, unmatched

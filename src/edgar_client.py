@@ -6,8 +6,10 @@ Handles all communication with the SEC EDGAR API.
 - Builds direct URLs to the actual filing documents
 """
 
+import re
 import time
 import requests
+from datetime import datetime
 
 from config import SEC_USER_AGENT, SEC_BASE_URL
 
@@ -80,6 +82,20 @@ def fetch_filing_html(document_url: str) -> str:
     response.raise_for_status()
     time.sleep(0.2)  # be polite to SEC's rate limit (~10 requests/sec)
     return response.text
+
+
+def extract_period_end_date(primary_document: str) -> str | None:
+    """
+    Extract the true reporting period-end date encoded in the filing's
+    primary document filename (e.g. 'bxsl-20250930.htm' -> '2025-09-30').
+    This is more reliable than the SEC filing_date, which is when the
+    document was submitted — typically 5-6 weeks AFTER the period end,
+    and NOT the date the Schedule of Investments is "as of".
+    """
+    match = re.search(r"(\d{8})", primary_document)
+    if not match:
+        return None
+    return datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
 
 
 if __name__ == "__main__":
