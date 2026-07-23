@@ -5,3 +5,5 @@ lxml
 pyxirr
 streamlit
 plotly
+anthropic
+python-dotenv

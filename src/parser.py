@@ -74,6 +74,23 @@ UNFUNDED_COMMITMENT_FIELDS = [
     "par_amount", "unrealized_gain_loss",
 ]  # 5 tokens — unfunded revolver/delayed draw commitments; no footnotes, rate, or cost basis
 
+def _is_money_market(tokens: list[str]) -> bool:
+    """
+    Distinguish a money-market/cash-equivalent line (name, yield%, cost,
+    fair_value, pct) from an unfunded commitment line (name, commitment
+    type, maturity_date, par_amount, unrealized_gain_loss) — both are
+    5 tokens after currency removal, so token count alone can't tell
+    them apart. The second token is the reliable discriminator: a
+    yield percentage (e.g. "3.50%") vs. a commitment type label
+    (e.g. "Revolver", "Delayed Draw Term Loan").
+    """
+    return bool(tokens) and len(tokens) > 1 and tokens[1].strip().endswith("%")
+
+
+MONEY_MARKET_FIELDS = [
+    "investment_name", "yield_rate", "cost", "fair_value", "pct_of_net_assets",
+]
+
 def find_schedule_of_investments_tables(html: str) -> list:
     """Locate every <table> that is part of the Schedule of Investments section."""
     soup = BeautifulSoup(html, "lxml")
@@ -190,6 +207,8 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
                 row_data = dict(zip(EQUITY_FIELDS, remaining))
             elif len(remaining) == 8:
                 row_data = dict(zip(PREFERRED_EQUITY_FIELDS, remaining))
+            elif len(remaining) == 5 and _is_money_market(remaining):
+                row_data = dict(zip(MONEY_MARKET_FIELDS, remaining))
             elif len(remaining) == 5:
                 row_data = dict(zip(UNFUNDED_COMMITMENT_FIELDS, remaining))
             else:

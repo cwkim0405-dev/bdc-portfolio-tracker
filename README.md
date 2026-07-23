@@ -39,5 +39,14 @@
 
 **Known issue carried into Phase 3**: Portfolio companies that are renamed/rebranded mid-filing history (e.g. a second lien tranche appearing under a different legal entity name in earlier quarters) are currently tracked as separate positions rather than being linked as the same underlying investment. This is a good candidate for the AI normalization layer.
 
-### Next: Phase 3 — Event Detection + AI Normalization Layer
-Detect entry/exit/markdown events across the time series, and introduce an AI-assisted normalization layer (column/industry standardization, company name reconciliation) for the long-tail rows that fall outside the deterministic parser's coverage.
+### Phase 3 (in progress): Event Detection + Deterministic Name Normalization
+
+**What was built**:
+- `src/metrics.py` — `clean_numeric_columns()` (numeric string parsing) and `detect_events()` (new_entry/exit/markdown/markup detection across the time series)
+- `src/normalizer.py` — deterministic entity-name normalization that strips legal-form suffixes (LLC, L.P., Inc., Co., Corp., etc.) whether they follow a comma ("Company Name, LLC") or appear as the trailing word with no comma ("Samsung Electronics Co"). Suffixes are only stripped when they form a standalone whitespace-delimited word, so fused tokens like "Co" inside "Box Co-Invest Blocker" are correctly preserved.
+
+**Bug found and fixed**: Inconsistent legal-suffix punctuation across filings (e.g. "BP Alpha Holdings, L.P." vs "BP Alpha Holdings, LP") caused the naive position-matching logic to register spurious exit + new_entry pairs for positions that were actually held continuously. Normalization resolved this without over-matching unrelated words.
+
+**Known limitation discovered during AI classification testing**: The parser's table discovery (`find_schedule_of_investments_tables`) anchors on tables following "Schedule of Investments" headings only. A separate "ADDITIONAL INFORMATION" section (containing Interest Rate Swaps and potentially other derivative positions) exists in the filing but is outside current parser coverage — these rows never reach the `unmatched` table at all, since they're never discovered in the first place. Given the relatively small notional amounts involved, this is documented as a scope boundary rather than addressed in Phase 3, to avoid open-ended scope creep.
+
+**Next**: AI-assisted classification of the long-tail unmatched rows (FX forwards, cash equivalents, and rows with source-level structural gaps) that fall outside the deterministic parser's coverage — this is where genuine company rebranding (e.g. a tranche appearing under a different legal entity name across quarters) will also be addressed.
