@@ -20,5 +20,24 @@
 
 **Design principle**: Long-tail row patterns beyond a reasonable point are intentionally not hardcoded further. Instead of chasing an ever-growing list of edge cases, remaining unmatched rows are handed off to an AI normalization layer (Phase 3) — a deliberate architectural choice, not a shortcut.
 
-### Next: Phase 2 — Time-Series Expansion
-Extend parsing across multiple historical quarters to build a time series of portfolio positions, enabling entry/exit and mark-to-market tracking.
+### Phase 2: Multi-Quarter Time-Series Pipeline — Complete
+
+**Scope**: Extend the Phase 1 parser across multiple historical filings to build a time series of BXSL's portfolio positions, tagged by true reporting period rather than SEC submission date.
+
+**What was built**:
+- `src/pipeline.py` — orchestrates fetching, parsing, and persisting filings across multiple quarters, with per-filing error isolation so one failed filing doesn't halt the pipeline
+- `data/bdc_tracker.db` (sqlite) — stores parsed positions (`positions` table) and unmatched rows (`unmatched_positions` table) across all quarters
+
+**Two data-integrity bugs found and fixed during this phase**:
+1. **Comparative prior-period contamination**: BDC 10-Q/10-K filings include both the current period's Schedule of Investments *and* a comparative prior-period schedule in the same document (e.g. "as of March 31, 2026 and December 31, 2025"). The initial pipeline tagged both with the same `filing_date`, causing duplicate/conflicting fair values for the same position. Fixed by extracting each table's true as-of date from its title block and filtering to the current period only — identified via the filing document's own filename (e.g. `bxsl-20250930.htm` → period end `2025-09-30`), which is more reliable than the SEC submission date.
+2. **Silent misclassification from missing fields**: A row with a missing `acquisition_date` field collapsed to the same token count as a fixed-rate debt row, causing every subsequent value to shift into the wrong column. Fixed by adding a floating-rate marker check (e.g. presence of "SOFR +") before accepting the fixed-rate schema match — rows that don't cleanly fit are now routed to `unmatched` instead of being silently parsed incorrectly.
+
+**Results**:
+- 8 quarters parsed (2024-06-30 through 2026-03-31)
+- 6,948 total positions persisted to sqlite
+- 83 unmatched rows across all quarters, consistent with Phase 1's long-tail categories (FX forwards, cash equivalents, unfunded commitments)
+
+**Known issue carried into Phase 3**: Portfolio companies that are renamed/rebranded mid-filing history (e.g. a second lien tranche appearing under a different legal entity name in earlier quarters) are currently tracked as separate positions rather than being linked as the same underlying investment. This is a good candidate for the AI normalization layer.
+
+### Next: Phase 3 — Event Detection + AI Normalization Layer
+Detect entry/exit/markdown events across the time series, and introduce an AI-assisted normalization layer (column/industry standardization, company name reconciliation) for the long-tail rows that fall outside the deterministic parser's coverage.
