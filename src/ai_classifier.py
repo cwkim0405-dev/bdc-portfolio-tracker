@@ -35,33 +35,37 @@ PRICE_PER_M_OUTPUT = 15.00
 # Static instructions, kept separate from the per-batch data so they can be
 # marked with cache_control — Anthropic charges only ~10% of the input
 # price for cached content on repeat calls within the cache's TTL.
-CLASSIFICATION_INSTRUCTIONS = """You are helping classify rows from a Business Development Company's (BDC) Schedule of Investments filing that a rules-based parser could not confidently structure.
+CLASSIFICATION_INSTRUCTIONS = """You are classifying rows from a Business Development Company's (BDC) Schedule of Investments filing that a rules-based parser could not confidently structure. This applies across different BDCs, not just one specific fund — rely on structural patterns, not company-specific names.
 
-For each row below, you are given:
-- debt_type: the broader category label active when this row appeared (may be null)
-- industry: the industry label active when this row appeared (may be null)
-- raw_tokens: the actual cell values from the filing row, in their original left-to-right order
+You are given, for each row:
+- section_heading: the nearest preceding broad section label (e.g. "First Lien Debt", "Second Lien Debt", "Equity", "Foreign Currency Forward Contracts", "Interest Rate Swaps") — use this as your PRIMARY signal when present
+- debt_type / industry: category context from the standard debt/equity walk (may be stale or null for derivative/commitment tables)
+- raw_tokens: the actual cell values, in original left-to-right order
 
-Classify each row into ONE of these investment_type categories:
-- "fx_forward": a foreign currency forward contract (bank counterparty, two currency amounts, a settlement date, and an unrealized appreciation/depreciation figure)
-- "interest_rate_swap": a swap contract (counterparty, hedged item/notes reference, receive/pay rates, notional amount, maturity date, fair market value)
-- "money_market_fund": a short-term cash-equivalent fund position (fund name, a yield/rate, and cost/fair value)
-- "equity_or_debt_with_gaps": looks like a normal equity or debt position, but is missing one or more expected fields (e.g. no acquisition date)
-- "other": doesn't fit any of the above — explain briefly in the "notes" field
+Use ALL FOUR of these signals together, in this priority order:
+1. section_heading — if it says "Foreign Currency Forward Contracts" or "Interest Rate Swaps", classify accordingly regardless of other signals.
+2. Keywords WITHIN the investment name itself — "Preferred Shares", "Preferred Interest", "Preferred Units" indicate preferred equity (which carries a dividend/coupon rate) as distinct from common equity/units (no rate). This distinction holds even when section_heading just says generic "Equity".
+3. A "commitment type" value among the tokens (e.g. "Revolver", "Delayed Draw Term Loan") signals an unfunded commitment row, even without a clear section_heading.
+4. Presence of a reference rate + spread (e.g. "SOFR +", "S +") vs. a single stated rate with no "+" distinguishes floating-rate from fixed-rate debt — but note BOTH First Lien and Second Lien debt can have either floating or fixed sub-rows; don't assume Second Lien is always fixed-rate.
 
-Extract whatever standard fields you can confidently identify. Use these field names precisely — do not substitute a similarly-named field:
-- investment_name, counterparty, currency
-- par_amount, cost
-- fair_value: the investment's current worth (for debt/equity positions only — NOT for derivatives)
-- unrealized_gain_loss: mark-to-market P&L (for FX forwards and interest rate swaps — this is a DIFFERENT concept from fair_value and must never be placed in the fair_value field)
-- currency_purchased_amount, currency_purchased_code, currency_sold_amount, currency_sold_code: for FX forwards specifically, extract the two currency legs as separate structured numeric fields, not just in notes
-- notional_amount: for interest rate swaps
-- pct_of_net_assets, settlement_date (for FX forwards), maturity_date (for swaps/debt — NOT the same as settlement_date), acquisition_date
+Classify into ONE of:
+- "floating_rate_debt_with_gap": debt row with a reference rate + spread (e.g. "SOFR +"), missing an expected field (commonly maturity_date or acquisition_date)
+- "fixed_rate_debt_with_gap": debt row with a single stated rate (no "+"), missing an expected field
+- "preferred_equity_with_gap": equity row where the investment name contains "Preferred" AND a rate is present, missing an expected field
+- "common_equity_with_gap": equity row with no rate (common stock/units/interests), missing an expected field
+- "unfunded_commitment_with_gap": row matching the unfunded commitment schema, missing an expected field
+- "fx_forward": foreign currency forward contract (bank counterparty, two currency legs, settlement date, unrealized gain/loss)
+- "interest_rate_swap": swap contract (counterparty, hedged item/notes reference, receive/pay rates, notional amount, maturity date, fair market value, upfront payments)
+- "money_market_fund": cash-equivalent fund line (fund name, yield%, cost, fair_value) OR an aggregate "Other Cash and Cash Equivalents" summary line
+- "other": doesn't fit any category — explain briefly in "notes"
 
-Use null for any field you cannot confidently determine — do NOT guess or fabricate a value, and do NOT place a value in a semantically wrong field (e.g. never put a settlement date in maturity_date, never put unrealized P&L in fair_value).
+Extract confidently-identifiable fields using these EXACT names (null if not confidently determinable — never guess or fabricate):
+investment_name, counterparty, currency, par_amount, cost, fair_value, unrealized_gain_loss, notional_amount, currency_purchased_amount, currency_purchased_code, currency_sold_amount, currency_sold_code, pct_of_net_assets, settlement_date, maturity_date, acquisition_date, dividend_or_yield_rate, commitment_type.
 
-Return ONLY a JSON array, one object per input row, in the same order as the input. Each object must have this shape:
-{"investment_type": "...", "investment_name": null, "counterparty": null, "currency": null, "par_amount": null, "cost": null, "fair_value": null, "unrealized_gain_loss": null, "currency_purchased_amount": null, "currency_purchased_code": null, "currency_sold_amount": null, "currency_sold_code": null, "notional_amount": null, "pct_of_net_assets": null, "settlement_date": null, "maturity_date": null, "acquisition_date": null, "notes": "..."}"""
+Never place a value in a semantically wrong field (settlement_date is NOT maturity_date; unrealized_gain_loss is NOT fair_value for derivatives).
+
+Return ONLY a JSON array, one object per input row, in the same order. Each object:
+{"investment_type": "...", "investment_name": null, "counterparty": null, "currency": null, "par_amount": null, "cost": null, "fair_value": null, "unrealized_gain_loss": null, "notional_amount": null, "currency_purchased_amount": null, "currency_purchased_code": null, "currency_sold_amount": null, "currency_sold_code": null, "pct_of_net_assets": null, "settlement_date": null, "maturity_date": null, "acquisition_date": null, "dividend_or_yield_rate": null, "commitment_type": null, "notes": "..."}"""
 
 
 def _estimate_cost(usage) -> float:
@@ -125,6 +129,7 @@ def classify_unmatched_rows(unmatched_df: pd.DataFrame, sample_size: int | None 
         batch = rows[i:i + BATCH_SIZE]
         batch_input = [
             {
+                "section_heading": r.get("section_heading"),
                 "debt_type": r.get("debt_type"),
                 "industry": r.get("industry"),
                 "raw_tokens": json.loads(r["raw_tokens"]) if isinstance(r["raw_tokens"], str) else r["raw_tokens"],

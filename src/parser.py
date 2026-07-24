@@ -7,8 +7,17 @@ Key filing quirks handled here:
 - "$" and "%" symbols are only rendered on the first row of a contiguous
   block, then omitted on subsequent rows — purely cosmetic, safe to drop.
 - Table cells are interleaved with empty spacer cells for HTML alignment.
-- Category/industry headers can span multiple physical tables, marked
-  with "(continued)" when a section carries over to a new page.
+- Category/industry headers (First Lien Debt, Second Lien Debt, Equity)
+  appear as ROWS inside the main schedule table and are tracked as state
+  (current_debt_type/current_industry) while walking rows in order.
+- Derivative/commitment section headers (Foreign Currency Forward
+  Contracts, Interest Rate Swaps, etc.) live in the "ADDITIONAL
+  INFORMATION" block as standalone paragraphs OUTSIDE any table, each
+  followed by its own table. These are tracked separately as
+  `section_heading` state, walking the document in order and updating
+  whenever a new heading is encountered — this is more robust than a
+  "nearest preceding heading" search, which could jump back across an
+  unrelated total/summary row depending on document structure.
 """
 
 import re
@@ -16,9 +25,46 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime
 
+DERIVATIVE_SECTION_NAMES = {
+    "Foreign Currency Forward Contracts", "Interest Rate Swaps",
+    "Total Return Swaps", "Credit Default Swaps", "Warrants", "Options",
+}
+
+def find_schedule_of_investments_tables(html: str) -> list:
+    """
+    Return every table that belongs to a "Schedule of Investments" block.
+    Collects ALL tables between one "Schedule of Investments" heading
+    occurrence and the next (current period vs. comparative prior period),
+    since derivative/commitment tables (FX forwards, interest rate swaps)
+    share the same page but were previously missed by only grabbing the
+    single table immediately after the heading.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    descendants = list(soup.descendants)
+
+    heading_positions = [
+        i for i, node in enumerate(descendants)
+        if isinstance(node, str) and "Schedule of Investments" in node
+    ]
+    table_positions = [
+        (i, node) for i, node in enumerate(descendants)
+        if getattr(node, "name", None) == "table"
+    ]
+
+    if not heading_positions:
+        return []
+
+    all_tables = []
+    for gi, start_idx in enumerate(heading_positions):
+        end_idx = heading_positions[gi + 1] if gi + 1 < len(heading_positions) else len(descendants)
+        group = [tbl for idx, tbl in table_positions if start_idx < idx < end_idx]
+        all_tables.extend(group)
+
+    return all_tables
+
+
 # Standard field order for a floating-rate debt row, once empty cells
 # and cosmetic $ / % symbols have been stripped out.
-# 3-letter ISO currency codes we expect to see in non-USD denominated rows
 KNOWN_CURRENCY_CODES = {
     "USD", "EUR", "GBP", "SEK", "DKK", "NOK", "CHF", "JPY", "AUD", "CAD",
     "NZD", "SGD", "HKD", "MXN", "BRL", "ZAR", "INR", "CNY", "KRW", "PLN",
@@ -26,6 +72,7 @@ KNOWN_CURRENCY_CODES = {
     # extend this list if a filing surfaces a code not covered here —
     # unmatched rows will surface it for review rather than failing silently
 }
+
 
 def _extract_currency(tokens: list[str]) -> tuple[str, list[str]]:
     """
@@ -37,6 +84,7 @@ def _extract_currency(tokens: list[str]) -> tuple[str, list[str]]:
         if tok in KNOWN_CURRENCY_CODES:
             return tok, tokens[:i] + tokens[i + 1:]
     return "USD", tokens
+
 
 FLOATING_RATE_FIELDS = [
     "investment_name", "footnotes", "reference_rate_base", "spread",
@@ -59,6 +107,7 @@ def _is_total_row(tokens: list[str]) -> bool:
     """
     return bool(tokens) and tokens[0].startswith("Total ")
 
+
 EQUITY_FIELDS = [
     "investment_name", "footnotes", "acquisition_date",
     "units", "cost", "fair_value", "pct_of_net_assets",
@@ -73,6 +122,7 @@ UNFUNDED_COMMITMENT_FIELDS = [
     "investment_name", "commitment_type", "maturity_date",
     "par_amount", "unrealized_gain_loss",
 ]  # 5 tokens — unfunded revolver/delayed draw commitments; no footnotes, rate, or cost basis
+
 
 def _is_money_market(tokens: list[str]) -> bool:
     """
@@ -90,17 +140,6 @@ def _is_money_market(tokens: list[str]) -> bool:
 MONEY_MARKET_FIELDS = [
     "investment_name", "yield_rate", "cost", "fair_value", "pct_of_net_assets",
 ]
-
-def find_schedule_of_investments_tables(html: str) -> list:
-    """Locate every <table> that is part of the Schedule of Investments section."""
-    soup = BeautifulSoup(html, "lxml")
-    candidates = []
-    for heading in soup.find_all(string=lambda s: s and "Schedule of Investments" in s):
-        parent = heading.find_parent()
-        table = parent.find_next("table") if parent else None
-        if table:
-            candidates.append(table)
-    return candidates
 
 
 def _row_cells(tr) -> list[str]:
@@ -140,6 +179,7 @@ def _is_column_header_row(tokens: list[str]) -> bool:
 
 DATE_PATTERN = re.compile(r"[A-Z][a-z]+[\s\xa0]+\d{1,2},[\s\xa0]+\d{4}")
 
+
 def _table_as_of_date(table) -> str | None:
     """
     Find the reporting date (e.g. 'September 30, 2025') that appears in
@@ -161,11 +201,14 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
     Walk every Schedule of Investments table IN ORDER, carrying category
     state (debt_type, industry) across table boundaries — this matters
     because a single logical section can be split across several tables
-    when it spans a page break in the filing.
+    when it spans a page break in the filing. Each table also carries a
+    section_heading (from find_schedule_of_investments_tables), populated
+    only for derivative/commitment tables outside the standard walk.
     """
     rows = []
     current_debt_type = None
     current_industry = None
+    current_section = None  # NEW: tracks derivative/commitment section (FX forwards, swaps, etc.)
     unmatched_count = 0
 
     for table in tables:
@@ -173,28 +216,31 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
             raw_cells = _row_cells(tr)
             if not raw_cells:
                 continue
-
             tokens = _clean_tokens(raw_cells)
             if not tokens:
                 continue
 
             if _is_column_header_row(tokens):
                 continue
-            
+
             if _is_section_header(raw_cells, tokens):
                 label = _clean_category_label(tokens[0])
-                if "Debt" in label or "Equity" in label:
+                if label in DERIVATIVE_SECTION_NAMES:
+                    current_section = label
+                    current_debt_type = None
+                    current_industry = None
+                elif "Debt" in label or "Equity" in label:
                     current_debt_type = label
+                    current_section = None
                 else:
                     current_industry = label
                 continue
 
             if _is_subtotal_row(raw_cells, tokens):
-                # Subtotals are recomputed from data rows later — skip for now.
                 continue
 
             if _is_total_row(tokens):
-                continue  # category-level total, not a real position
+                continue
 
             currency, remaining = _extract_currency(tokens)
             has_floating_marker = any(t.endswith("+") for t in remaining)
@@ -216,6 +262,7 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
                 rows.append({
                     "debt_type": current_debt_type,
                     "industry": current_industry,
+                    "section_heading": current_section,
                     "raw_tokens": tokens,
                     "raw_cells": raw_cells,
                 })
@@ -224,6 +271,7 @@ def parse_all_tables(tables: list) -> pd.DataFrame:
             row_data["currency"] = currency
             row_data["debt_type"] = current_debt_type
             row_data["industry"] = current_industry
+            row_data["section_heading"] = current_section
             rows.append(row_data)
 
     if unmatched_count:
@@ -248,5 +296,7 @@ def parse_filing_html(html: str, target_period_end: str) -> tuple[pd.DataFrame, 
 
     df = parse_all_tables(current_tables)
     parsed = df[df["raw_tokens"].isna()].drop(columns=["raw_tokens", "raw_cells"], errors="ignore")
-    unmatched = df[df["raw_tokens"].notna()][["debt_type", "industry", "raw_tokens", "raw_cells"]]
+    unmatched = df[df["raw_tokens"].notna()][
+        ["debt_type", "industry", "section_heading", "raw_tokens", "raw_cells"]
+    ]
     return parsed, unmatched

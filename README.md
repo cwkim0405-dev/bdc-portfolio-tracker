@@ -49,4 +49,25 @@
 
 **Known limitation discovered during AI classification testing**: The parser's table discovery (`find_schedule_of_investments_tables`) anchors on tables following "Schedule of Investments" headings only. A separate "ADDITIONAL INFORMATION" section (containing Interest Rate Swaps and potentially other derivative positions) exists in the filing but is outside current parser coverage — these rows never reach the `unmatched` table at all, since they're never discovered in the first place. Given the relatively small notional amounts involved, this is documented as a scope boundary rather than addressed in Phase 3, to avoid open-ended scope creep.
 
-**Next**: AI-assisted classification of the long-tail unmatched rows (FX forwards, cash equivalents, and rows with source-level structural gaps) that fall outside the deterministic parser's coverage — this is where genuine company rebranding (e.g. a tranche appearing under a different legal entity name across quarters) will also be addressed.
+### Phase 3: AI-Assisted Classification & Entity Normalization — Complete
+
+**Scope**: Handle the long-tail rows the deterministic parser couldn't structure (FX forwards, cash-equivalent summary lines, positions with source-level missing fields) via Claude API classification, and resolve entity-naming inconsistencies across filings via deterministic normalization.
+
+**What was built**:
+- `src/normalizer.py` — deterministic entity-name normalization. Strips legal-form suffixes (LLC, L.P., Inc., Co., Corp., etc.) whether they follow a comma ("Company Name, LLC") or appear as the trailing word with no comma ("Samsung Electronics Co"), while preserving hyphen-fused words like "Co" in "Box Co-Invest Blocker."
+- `src/ai_classifier.py` — batches unmatched rows to Claude (`claude-sonnet-4-5`) for classification into `fx_forward`, `interest_rate_swap`, `money_market_fund`, `equity_or_debt_with_gaps`, or `other`, with structured field extraction (counterparty, currency legs, settlement date, unrealized gain/loss, etc.). Defaults to a 15-row sample; full-scale runs require explicit opt-in. Prints actual per-batch token cost from the API response.
+- Design boundary maintained throughout: the AI classifies and maps fields — it never computes IRR, MOIC, or any other financial metric. All numeric analysis stays in deterministic code (`metrics.py`).
+
+**Bugs found via this phase's validation work** (deterministic, not AI):
+1. Legal-suffix punctuation inconsistency ("BP Alpha Holdings, L.P." vs "...LP") caused spurious exit + new_entry event pairs — fixed via `normalizer.py`.
+2. Money-market fund rows and unfunded-commitment rows both parse to 5 tokens, causing silent field misassignment (fair_value ended up null) — fixed by adding a discriminator based on whether the second token is a yield percentage.
+
+**Results**:
+- 456 unmatched rows classified: ~90% `equity_or_debt_with_gaps` (mostly rows with a source-level missing field, e.g. no acquisition date), remainder split between `fx_forward`, `money_market_fund`, and `other`
+- FX forward classification validated against source filing screenshots — counterparty, both currency legs, settlement date, and unrealized gain/loss all matched exactly
+- Total AI classification cost across the full run: ~$1.87
+
+**Known limitation**: Interest Rate Swaps (found under a separate "ADDITIONAL INFORMATION" section in the filing, outside "Schedule of Investments") are not yet discovered by the parser at all — documented as a scope boundary given the small notional amounts involved, rather than addressed here.
+
+### Next: Phase 4 — IRR/MOIC Calculation & Dashboard
+Compute deal-level and portfolio-level return metrics from the cleaned time series, and build a Streamlit dashboard for exploring holdings, events, and returns.
